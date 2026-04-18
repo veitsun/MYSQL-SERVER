@@ -64,9 +64,12 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <stdarg.h>
 #include <sys/types.h>
 #include <time.h>
+#include <algorithm>
+#include <fstream>
 #include <map>
 #include <new>
 #include <sstream>
+#include <vector>
 
 #include "buf0checksum.h"
 #include "buf0dump.h"
@@ -315,6 +318,200 @@ static buf_pool_chunk_map_t *buf_chunk_map_reg;
 /** Container for how many pages from each index are contained in the buffer
 pool(s). */
 buf_stat_per_index_t *buf_stat_per_index;
+
+#ifdef HAVE_LIBNUMA
+/** CSV file used to dump NUMA placement of each buffer frame. */
+static constexpr const char *BUF_POOL_NUMA_CSV_FILENAME =
+    "innodb_buffer_frame_numa.csv";
+
+/** Convert block state enum to a stable string for CSV rows. */
+static const char *buf_block_state_to_string(buf_page_state state) {
+  switch (state) {
+    case BUF_BLOCK_POOL_WATCH:
+      return "BUF_BLOCK_POOL_WATCH";
+    case BUF_BLOCK_ZIP_PAGE:
+      return "BUF_BLOCK_ZIP_PAGE";
+    case BUF_BLOCK_ZIP_DIRTY:
+      return "BUF_BLOCK_ZIP_DIRTY";
+    case BUF_BLOCK_NOT_USED:
+      return "BUF_BLOCK_NOT_USED";
+    case BUF_BLOCK_READY_FOR_USE:
+      return "BUF_BLOCK_READY_FOR_USE";
+    case BUF_BLOCK_FILE_PAGE:
+      return "BUF_BLOCK_FILE_PAGE";
+    case BUF_BLOCK_MEMORY:
+      return "BUF_BLOCK_MEMORY";
+    case BUF_BLOCK_REMOVE_HASH:
+      return "BUF_BLOCK_REMOVE_HASH";
+  }
+
+  return "BUF_BLOCK_UNKNOWN";
+}
+
+/** Build CSV path under innodb_data_home_dir (or current dir if empty). */
+static std::string buf_pool_numa_csv_path() {
+  std::string base_dir = ".";
+
+  if (srv_data_home != nullptr && *srv_data_home != '\0') {
+    base_dir = Fil_path::remove_quotes(srv_data_home);
+  }
+
+  if (base_dir.empty()) {
+    base_dir = ".";
+  }
+
+  const auto last_sep = base_dir.find_last_of(Fil_path::SEPARATOR);
+  if (last_sep == std::string::npos || last_sep != base_dir.size() - 1) {
+    base_dir.push_back(Fil_path::OS_SEPARATOR);
+  }
+
+  base_dir.append(BUF_POOL_NUMA_CSV_FILENAME);
+  return base_dir;
+}
+
+/** Dump NUMA-node location per buffer frame to a CSV file. */
+static void buf_pool_dump_frame_numa_csv() {
+  if (buf_pool_ptr == nullptr || srv_buf_pool_instances == 0) {
+    return;
+  }
+
+  if (numa_available() == -1) {
+    ib::warn() << "Skipping InnoDB NUMA frame CSV dump because NUMA is not "
+                  "available on this host.";
+    return;
+  }
+
+  const long os_page_size = sysconf(_SC_PAGESIZE);
+  if (os_page_size <= 0) {
+    ib::warn() << "Skipping InnoDB NUMA frame CSV dump because sysconf("
+                  "_SC_PAGESIZE) failed.";
+    return;
+  }
+
+  const ulint pages_per_frame = static_cast<ulint>(
+      (UNIV_PAGE_SIZE + os_page_size - 1) / os_page_size);
+  if (pages_per_frame == 0) {
+    ib::warn() << "Skipping InnoDB NUMA frame CSV dump due to invalid "
+                  "pages_per_frame=0.";
+    return;
+  }
+
+  const std::string csv_path = buf_pool_numa_csv_path();
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+
+  if (!csv.is_open()) {
+    ib::warn() << "Failed to open NUMA frame CSV file: " << csv_path;
+    return;
+  }
+
+  csv << "buf_pool_instance,chunk_index,block_index,frame_address,block_state,"
+         "os_page_size,innodb_page_size,numa_nodes,numa_node_page_counts,"
+         "unknown_page_count,query_error\n";
+
+  std::vector<void *> pages(pages_per_frame);
+  std::vector<int> page_status(pages_per_frame, 0);
+  std::vector<int> nodes;
+  std::vector<ulint> node_counts;
+  nodes.reserve(pages_per_frame);
+  node_counts.reserve(pages_per_frame);
+
+  ulint total_frames = 0;
+  ulint query_failures = 0;
+
+  ib::info() << "Dumping InnoDB buffer frame NUMA placement to " << csv_path;
+
+  for (ulint pool_id = 0; pool_id < srv_buf_pool_instances; ++pool_id) {
+    buf_pool_t *buf_pool = buf_pool_from_array(pool_id);
+
+    mutex_enter(&buf_pool->chunks_mutex);
+
+    for (ulint chunk_id = 0; chunk_id < buf_pool->n_chunks; ++chunk_id) {
+      const buf_chunk_t *chunk = &buf_pool->chunks[chunk_id];
+
+      for (ulint block_id = 0; block_id < chunk->size; ++block_id) {
+        const buf_block_t *block = &chunk->blocks[block_id];
+        byte *frame = block->frame;
+
+        for (ulint page_idx = 0; page_idx < pages_per_frame; ++page_idx) {
+          pages[page_idx] = frame + page_idx * os_page_size;
+        }
+
+        errno = 0;
+        std::fill(page_status.begin(), page_status.end(), 0);
+
+        const int ret = move_pages(0, pages_per_frame, pages.data(), nullptr,
+                                   page_status.data(), 0);
+        const int query_error = (ret == 0) ? 0 : errno;
+
+        nodes.clear();
+        node_counts.clear();
+
+        ulint unknown_pages = 0;
+
+        if (ret == 0) {
+          for (const auto node : page_status) {
+            if (node < 0) {
+              ++unknown_pages;
+              continue;
+            }
+
+            auto node_it = std::find(nodes.begin(), nodes.end(), node);
+            if (node_it == nodes.end()) {
+              nodes.push_back(node);
+              node_counts.push_back(1);
+            } else {
+              const auto node_pos = static_cast<size_t>(node_it - nodes.begin());
+              ++node_counts[node_pos];
+            }
+          }
+        } else {
+          ++query_failures;
+          unknown_pages = pages_per_frame;
+        }
+
+        csv << pool_id << ',' << chunk_id << ',' << block_id << ','
+            << static_cast<const void *>(frame) << ','
+            << buf_block_state_to_string(buf_block_get_state(block)) << ','
+            << os_page_size << ',' << UNIV_PAGE_SIZE << ',';
+
+        for (size_t i = 0; i < nodes.size(); ++i) {
+          if (i > 0) {
+            csv << ';';
+          }
+          csv << nodes[i];
+        }
+
+        csv << ',';
+
+        for (size_t i = 0; i < nodes.size(); ++i) {
+          if (i > 0) {
+            csv << ';';
+          }
+          csv << nodes[i] << ':' << node_counts[i];
+        }
+
+        csv << ',' << unknown_pages << ',' << query_error << '\n';
+
+        ++total_frames;
+      }
+    }
+
+    mutex_exit(&buf_pool->chunks_mutex);
+  }
+
+  csv.flush();
+
+  if (!csv.good()) {
+    ib::warn() << "NUMA frame CSV dump was incomplete due to an I/O error. "
+                  "path="
+               << csv_path;
+    return;
+  }
+
+  ib::info() << "Finished NUMA frame CSV dump. total_frames=" << total_frames
+             << ", query_failures=" << query_failures << ", path=" << csv_path;
+}
+#endif /* HAVE_LIBNUMA */
 
 #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
 /** This is used to insert validation operations in execution
@@ -6733,6 +6930,10 @@ const char *buf_block_t::get_page_type_str() const noexcept {
 #ifndef UNIV_HOTBACKUP
 /** Frees the buffer pool instances and the global data structures. */
 void buf_pool_free_all() {
+#ifdef HAVE_LIBNUMA
+  buf_pool_dump_frame_numa_csv();
+#endif /* HAVE_LIBNUMA */
+
   for (ulint i = 0; i < srv_buf_pool_instances; ++i) {
     buf_pool_t *ptr = &buf_pool_ptr[i];
 
