@@ -145,10 +145,12 @@ build/runtime_output_directory/mysqld \
   --port=$PORT \
   --pid-file="$RUN_BASE/mysql.pid" \
   --log-error="$RUN_BASE/error.log" \
-  --innodb_buffer_pool_size=256M \
+  --innodb_buffer_pool_instances=8 \
+  --innodb_buffer_pool_size=2G \
+  --innodb-numa-interleave-instance=ON \
   --daemonize
 
-# 造一点 InnoDB 访问
+# 造一点 InnoDB 访问（这是真一点点数据，只插入 10 行数据）
 build/runtime_output_directory/mysql --no-defaults -uroot -S "$SOCKET" -e "
 CREATE DATABASE IF NOT EXISTS numa_demo;
 USE numa_demo;
@@ -160,6 +162,115 @@ SELECT REPEAT('x',100), seq FROM (
 ) s;
 SELECT COUNT(*) FROM t;
 "
+
+# 造更多的数据，大概在 1.5 G 数据量
+build/runtime_output_directory/mysql --no-defaults -uroot -S "$SOCKET" -e "
+CREATE DATABASE IF NOT EXISTS numa_demo;
+USE numa_demo;
+DROP TABLE IF EXISTS t;
+CREATE TABLE t(
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  c1 VARCHAR(1000),
+  c2 INT
+) ENGINE=InnoDB;
+
+INSERT INTO t(c1, c2)
+SELECT REPEAT('x', 1000), seq
+FROM (
+  SELECT
+    a.i
+    + b.i * 10
+    + c.i * 100
+    + d.i * 1000
+    + e.i * 10000
+    + f.i * 100000
+    + g.i * 1000000
+    + 1 AS seq
+  FROM
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) a
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) b
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) c
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) d
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) e
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) f
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) g
+) AS x
+WHERE seq <= 2000000;
+
+SELECT COUNT(*) AS row_count FROM t;
+"
+
+# 随机读写压测脚本（相当于 sysbench 的 run 阶段）
+
+前面的建表和造数步骤相当于 `sysbench prepare`。下面这个脚本直接对已经存在的 `numa_demo.t` 做随机读写压测，不需要重新初始化表。
+
+脚本路径：
+
+```bash
+scripts/numa_random_rw_bench.py
+```
+
+默认行为：
+
+- 随机点查 `id`
+- 做小范围 `BETWEEN` 查询
+- 事务内随机执行 `UPDATE`、`INSERT`、`DELETE`
+- 多线程并发输出吞吐和延迟
+
+先确认 `SOCKET` 变量已经设置好，然后直接运行：
+
+```bash
+python3 scripts/numa_random_rw_bench.py \
+  --mysql-bin build/runtime_output_directory/mysql \
+  --socket "$SOCKET" \
+  --database numa_demo \
+  --table t \
+  --threads 8 \
+  --time 300 \
+  --report-interval 5 \
+  --read-ratio 0.8
+```
+
+参数说明：
+
+- `--threads`：并发线程数，类似 sysbench 的 `--threads`
+- `--time`：压测时长，单位秒
+- `--report-interval`：输出间隔
+- `--read-ratio`：读事务占比，例如 `0.8` 表示 80% 读、20% 写
+- `--point-selects`：每个读事务里的随机点查次数
+- `--range-size`：范围查询的跨度
+- `--update-pct`、`--insert-pct`、`--delete-pct`：写事务内部的操作比例，三者之和必须等于 `1.0`
+
+如果你想更接近 sysbench 的 `oltp_read_write`，可以用：
+
+```bash
+python3 scripts/numa_random_rw_bench.py \
+  --mysql-bin build/runtime_output_directory/mysql \
+  --socket "$SOCKET" \
+  --database numa_demo \
+  --table t \
+  --threads 16 \
+  --time 600 \
+  --report-interval 10 \
+  --read-ratio 0.8 \
+  --point-selects 10 \
+  --range-size 100 \
+  --update-pct 0.7 \
+  --insert-pct 0.15 \
+  --delete-pct 0.15
+```
+
+说明：
+
+- 这个脚本不依赖 `PyMySQL` 或 `mysql-connector`，只使用仓库自带的 `mysql` 客户端。
+- 如果 `--socket` 为空，会直接报错，所以必须先确保 `SOCKET` 环境变量正确。
+- 压测结束后，仍然用 `mysqladmin --no-defaults -uroot -S "$SOCKET" shutdown` 正常关闭 mysqld。
 
 # 触发导出（关键）
 build/runtime_output_directory/mysqladmin --no-defaults -uroot -S "$SOCKET" shutdown
@@ -229,7 +340,51 @@ my.cnf 的 [mysqld] 文件 下加：
 innodb_numa_interleave=ON
 ```
 
-# linux 服务器开启关闭 autoNUMA
+# innodb_numa_interleave_instance — Buffer Pool Instance 级 NUMA 绑定
+
+## 背景
+
+原有的 `innodb_numa_interleave` 使用 `MPOL_INTERLEAVE` 策略，以 4KB OS 页为粒度在所有 NUMA node 间轮询分配内存。这导致一个 16KB 的 InnoDB page 被切成 4 片分散在不同 node 上，读取一个 page 最多需要跨 4 个 node 取数据。
+
+`innodb_numa_interleave_instance` 改为以 **buffer pool instance** 为粒度，将每个 instance 的内存整体绑定到一个固定的 NUMA node（`MPOL_BIND`），按 `instance_no % num_nodes` 轮询分配。这样每个 16KB page 物理上完整地位于一个 node，消除了 intra-page 跨 node 访问。
+
+## 涉及文件
+
+| 文件 | 改动内容 |
+|------|---------|
+| `storage/innobase/include/srv0srv.h` | 新增 `extern bool srv_numa_interleave_instance` 声明 |
+| `storage/innobase/srv/srv0srv.cc` | 新增变量定义，默认 `false` |
+| `storage/innobase/handler/ha_innodb.cc` | 注册 `MYSQL_SYSVAR_BOOL(numa_interleave_instance, ...)` 并加入 sysvar 数组 |
+| `storage/innobase/buf/buf0buf.cc` | `buf_pool_t::allocate_chunk` 中新增 `else if` 分支，执行 `mbind(MPOL_BIND)` |
+
+## 使用方式
+
+两个参数互斥，同时开启时 `innodb_numa_interleave` 优先。
+
+**临时开启（单次启动）：**
+```bash
+build/runtime_output_directory/mysqld \
+  --no-defaults \
+  --innodb_buffer_pool_instances=8 \
+  --innodb_buffer_pool_size=256M \
+  --innodb-numa-interleave-instance=ON \
+  ...
+```
+
+**持久开启（配置文件）：**
+```ini
+[mysqld]
+innodb_numa_interleave_instance = ON
+```
+
+## 注意事项
+
+- 需要编译时启用 libnuma（`-DWITH_NUMA=ON` 或系统已安装 `libnuma-dev`），否则该参数不会编译进去（整个逻辑在 `#ifdef HAVE_LIBNUMA` 内）。
+- 建议将 `innodb_buffer_pool_instances` 设置为 NUMA node 数量的整数倍，以保证各 node 分配到相同数量的 instance，避免内存不均衡。
+- 该参数为 `PLUGIN_VAR_READONLY`，只能在启动时设置，运行时不可更改。
+- 绑定时使用 `MPOL_MF_MOVE` 标志，会将已分配但尚未物理落页的内存迁移到目标 node，启动时 error log 中会打印每个 instance 的绑定信息。
+
+## linux 服务器开启关闭 autoNUMA
 
 1、查看当前状态
 ```bash

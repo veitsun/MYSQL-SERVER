@@ -217,6 +217,10 @@ bool srv_use_native_aio = false;
 
 bool srv_numa_interleave = false;
 
+#ifdef HAVE_LIBNUMA
+bool srv_numa_interleave_instance = false;
+#endif /* HAVE_LIBNUMA */
+
 #ifdef UNIV_DEBUG
 /** Force all user tables to use page compression. */
 ulong srv_debug_compress;

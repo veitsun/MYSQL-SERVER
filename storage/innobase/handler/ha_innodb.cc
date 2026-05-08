@@ -22837,6 +22837,13 @@ static MYSQL_SYSVAR_BOOL(
     PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_READONLY,
     "Use NUMA interleave memory policy to allocate InnoDB buffer pool.",
     nullptr, nullptr, false);
+
+static MYSQL_SYSVAR_BOOL(
+    numa_interleave_instance, srv_numa_interleave_instance,
+    PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_READONLY,
+    "Bind each InnoDB buffer pool instance to a dedicated NUMA node "
+    "(round-robin). Require s innodb_numa_interleave=OFF.",
+    nullptr, nullptr, false);
 #endif /* HAVE_LIBNUMA */
 
 static MYSQL_SYSVAR_BOOL(
@@ -23252,6 +23259,7 @@ static SYS_VAR *innobase_system_variables[] = {
     MYSQL_SYSVAR(use_native_aio),
 #ifdef HAVE_LIBNUMA
     MYSQL_SYSVAR(numa_interleave),
+    MYSQL_SYSVAR(numa_interleave_instance),
 #endif /* HAVE_LIBNUMA */
     MYSQL_SYSVAR(change_buffering),
     MYSQL_SYSVAR(change_buffer_max_size),

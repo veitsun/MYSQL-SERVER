@@ -326,6 +326,7 @@ static constexpr const char *BUF_POOL_NUMA_CSV_FILENAME =
 
 /** Convert block state enum to a stable string for CSV rows. */
 static const char *buf_block_state_to_string(buf_page_state state) {
+  // 枚举转字符串函数，它把 buf_page_state 转成固定文本
   switch (state) {
     case BUF_BLOCK_POOL_WATCH:
       return "BUF_BLOCK_POOL_WATCH";
@@ -350,6 +351,7 @@ static const char *buf_block_state_to_string(buf_page_state state) {
 
 /** Build CSV path under innodb_data_home_dir (or current dir if empty). */
 static std::string buf_pool_numa_csv_path() {
+  // 用来拼 CSV 输出路径
   std::string base_dir = ".";
 
   if (srv_data_home != nullptr && *srv_data_home != '\0') {
@@ -381,13 +383,14 @@ static void buf_pool_dump_frame_numa_csv() {
     return;
   }
 
-  const long os_page_size = sysconf(_SC_PAGESIZE);
+  const long os_page_size = sysconf(_SC_PAGESIZE);  // 获取 os page 大小
   if (os_page_size <= 0) {
     ib::warn() << "Skipping InnoDB NUMA frame CSV dump because sysconf("
                   "_SC_PAGESIZE) failed.";
     return;
   }
 
+  // 计算一个 InnoDB frame 由多少个 OS page 组成。也就是说，代码不是只查 frame 起始地址一次，而是把构成该 frame 的每个 OS page 都查出来。这样才能看出这个 16KB frame 是否被“拆散”到了多个 NUMA node 上。
   const ulint pages_per_frame = static_cast<ulint>(
       (UNIV_PAGE_SIZE + os_page_size - 1) / os_page_size);
   if (pages_per_frame == 0) {
@@ -404,6 +407,7 @@ static void buf_pool_dump_frame_numa_csv() {
     return;
   }
 
+  // 这里写了表头
   csv << "buf_pool_instance,chunk_index,block_index,frame_address,block_state,"
          "os_page_size,innodb_page_size,numa_nodes,numa_node_page_counts,"
          "unknown_page_count,query_error\n";
@@ -420,19 +424,23 @@ static void buf_pool_dump_frame_numa_csv() {
 
   ib::info() << "Dumping InnoDB buffer frame NUMA placement to " << csv_path;
 
+  // 三层循环遍历
   for (ulint pool_id = 0; pool_id < srv_buf_pool_instances; ++pool_id) {
+    // pool_id 遍历所有 buffer pool instance
     buf_pool_t *buf_pool = buf_pool_from_array(pool_id);
 
-    mutex_enter(&buf_pool->chunks_mutex);
+    mutex_enter(&buf_pool->chunks_mutex); // 拿这个锁保证遍历操作是原子操作，这些结构在中途不会被改动
 
     for (ulint chunk_id = 0; chunk_id < buf_pool->n_chunks; ++chunk_id) {
+      // 遍历 instance 的所有 chunk
       const buf_chunk_t *chunk = &buf_pool->chunks[chunk_id];
 
       for (ulint block_id = 0; block_id < chunk->size; ++block_id) {
+        // 遍历该chunk 里的所有 block
         const buf_block_t *block = &chunk->blocks[block_id];
-        byte *frame = block->frame;
+        byte *frame = block->frame;  // 先拿到当前 block 的 frame 的起始地址
 
-        for (ulint page_idx = 0; page_idx < pages_per_frame; ++page_idx) {
+        for (ulint page_idx = 0; page_idx < pages_per_frame; ++page_idx) { // 然后把这个 frame 覆盖到的每个 os page 起始地址都填进 pages[]
           pages[page_idx] = frame + page_idx * os_page_size;
         }
 
@@ -1097,6 +1105,37 @@ bool buf_pool_t::allocate_chunk(ulonglong mem_size, buf_chunk_t *chunk) {
                "MPOL_MF_MOVE", strerror(errno));
     }
     numa_bitmask_free(numa_nodes);
+  } else if (srv_numa_interleave_instance) {
+    // 当开启 innodb_numa_interleave_instance 时， 不再把整个 InnoDB buffer pool 按 numa 节点做 “页级交错分配”， 而是把每个 buffer pool instance 绑定到一个固定的 numa node 上， 上层采用轮询方式做映射
+
+    // 这里从 chunk->mem 里拿到底层内存映射信息， 是这个 buffer pool chunk 的起始地址
+    const auto low_level_info = ut::large_page_low_level_info(
+        chunk->mem, ut::fallback_to_normal_page_t{}); // 会返回真正给内核做内存策略绑定所需的信息
+    
+    // 获取当前机器配置的 numa node 数量
+    int num_nodes = numa_num_configured_nodes();
+    int target_node = (int)(this->instance_no % (ulint)num_nodes); // 给当前 buffer pool instance 算出目标 node，这是一个典型的轮询映射
+    struct bitmask *node_mask = numa_allocate_nodemask();  // 这里构造了一个 numa 节点掩码，只把目标节点那一位设为 1 
+    numa_bitmask_setbit(node_mask, target_node); // 只把目标节点那一位设为 1
+
+    // 打印一条日志，表示当前 instance 要绑定到哪一个 numa node
+    ib::info(ER_IB_MSG_47) << "Binding buffer pool instance "
+                           << this->instance_no << " to NUMA node "
+                           << target_node;
+
+    // 这里就不直接拿 chunk->mem , 而是 拿这份底层真实分配区间的信息
+    // 这是关键调用，直接让 linux 内核对这段内存施加 numa 策略
+    int st = mbind(low_level_info.base_ptr, low_level_info.allocation_size,
+                   MPOL_BIND, node_mask->maskp, node_mask->size,
+                   MPOL_MF_MOVE); // MPOL_BIND 绑定策略，表示这段内存应优先从指定 node 分配； MPOL_MF_MOVE 表示如果这段内存已经有页落在别的 node 上，尝试把已有的页迁移到 目标 node
+
+    
+    if (st != 0) {
+      ib::warn(ER_IB_MSG_54, low_level_info.base_ptr,
+               low_level_info.allocation_size, "MPOL_BIND",
+               "MPOL_MF_MOVE", strerror(errno));
+    }
+    numa_bitmask_free(node_mask); // 释放前面申请的 node mask，避免内存泄漏
   }
 #endif /* HAVE_LIBNUMA */
 
@@ -1449,6 +1488,7 @@ static void buf_pool_create(buf_pool_t *buf_pool, ulint buf_pool_size,
     }
 
     buf_pool->curr_size = 0;
+    buf_pool->instance_no = instance_no;
     chunk = buf_pool->chunks;
 
     do {
