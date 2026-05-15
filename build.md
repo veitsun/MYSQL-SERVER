@@ -121,7 +121,7 @@ CSV 字段：
 ```bash
 cd /home/xmu/MYSQL-SERVER
 
-RUN_BASE=$PWD/build/numa_probe_run
+RUN_BASE=$PWD/build/numa_probe_run6
 DATADIR=$RUN_BASE/data
 SOCKET=$RUN_BASE/mysql.sock
 PORT=3407
@@ -136,7 +136,7 @@ build/runtime_output_directory/mysqld \
   --datadir="$DATADIR" \
   --initialize-insecure
 
-# 启动
+# instance interleave 启动
 build/runtime_output_directory/mysqld \
   --no-defaults \
   --basedir=$PWD/build \
@@ -149,6 +149,35 @@ build/runtime_output_directory/mysqld \
   --innodb_buffer_pool_size=2G \
   --innodb-numa-interleave-instance=ON \
   --daemonize
+
+# os page interleave 启动
+build/runtime_output_directory/mysqld \
+  --no-defaults \
+  --basedir=$PWD/build \
+  --datadir="$DATADIR" \
+  --socket="$SOCKET" \
+  --port=$PORT \
+  --pid-file="$RUN_BASE/mysql.pid" \
+  --log-error="$RUN_BASE/error.log" \
+  --innodb_buffer_pool_instances=8 \
+  --innodb_buffer_pool_size=2G \
+  --innodb-numa-interleave=ON \
+  --daemonize
+
+# fist-touch 启动
+build/runtime_output_directory/mysqld \
+  --no-defaults \
+  --basedir=$PWD/build \
+  --datadir="$DATADIR" \
+  --socket="$SOCKET" \
+  --port=$PORT \
+  --pid-file="$RUN_BASE/mysql.pid" \
+  --log-error="$RUN_BASE/error.log" \
+  --innodb_buffer_pool_instances=8 \
+  --innodb_buffer_pool_size=2G \
+  --daemonize
+
+# database page interleave
 
 # 造一点 InnoDB 访问（这是真一点点数据，只插入 10 行数据）
 build/runtime_output_directory/mysql --no-defaults -uroot -S "$SOCKET" -e "
@@ -405,6 +434,100 @@ echo 1 > /proc/sys/kernel/numa_balancing
 sysctl -w kernel.numa_balancing=0
 # 或
 echo 0 > /proc/sys/kernel/numa_balancing
+```
+
+---
+
+# NUMA 监控脚本
+
+## scripts/numa_monitor.py（推荐使用）
+
+统一 NUMA 监控工具，将两类指标合并在一张图上：
+
+| 线条 | 颜色 | 数据来源 | 含义 |
+|------|------|---------|------|
+| 蓝色虚线 | blue dashed | `/proc/vmstat` `numa_hint_faults` | AutoNUMA 采样的运行时跨节点访问率（需 `kernel.numa_balancing=1`） |
+| 绿色点线 | green dotted | `/proc/vmstat` `numa_local` / `numa_other` | 新页分配时的跨节点率（仅 buffer pool 初始化阶段非零） |
+
+图中还有三条水平均值线：
+
+- **绿色实线**：绿线非零阶段（buffer pool 初始化期）的平均分配远端率
+- **蓝色点划线**：绿线归零之后（稳态压测阶段）蓝线的平均访问率
+- **深蓝色点线**：蓝线整体平均访问率
+
+### 用法
+
+```bash
+# 一次性快照（绝对计数）
+python3 scripts/numa_monitor.py --pid <mysqld-pid> --once
+
+# 持续监控，5 秒采样，60 秒后自动绘图退出
+python3 scripts/numa_monitor.py --pid <mysqld-pid> \
+    --interval 5 --duration 60 --output ./numa_profile/combined.csv
+
+# 通过 pid 文件（可在 mysqld 启动前提前运行，脚本等待最多 30 秒）
+python3 scripts/numa_monitor.py --pid-file "$RUN_BASE/mysql.pid" \
+    --interval 5 --duration 120 --output ./numa_profile/combined.csv
+```
+
+> **注意**：要捕获 buffer pool 初始化阶段的绿线（分配局部性），必须在 mysqld 启动前或启动后立即运行脚本。推荐使用 `--pid-file` 模式，脚本会自动等待 pid 文件出现（最多 30 秒）。
+
+输出文件：
+
+- `<output>.csv`：每个采样点的原始数据
+- `<output>_plot.png`：时序折线图（需 matplotlib；无 matplotlib 时退化为 ASCII 图）
+
+### 参数说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--pid` | — | mysqld 进程 PID（与 `--pid-file` 二选一） |
+| `--pid-file` | — | mysql.pid 文件路径，脚本等待文件出现后读取 PID |
+| `--once` | — | 打印一次绝对计数快照后退出 |
+| `--interval` | 5.0 | 采样间隔（秒） |
+| `--duration` | 无限 | 运行时长（秒），到达后自动绘图退出 |
+| `--output` | 不保存 | CSV 输出路径，目录不存在时自动创建 |
+
+### CSV 字段
+
+| 字段 | 说明 |
+|------|------|
+| `timestamp` | 采样时刻（`YYYY-MM-DD HH:MM:SS`） |
+| `elapsed_s` | 距监控启动的秒数 |
+| `local_node` | `/sys/.../numastat` `local_node` 增量 |
+| `other_node` | `/sys/.../numastat` `other_node` 增量 |
+| `node_remote_pct` | `other_node / (local_node + other_node) × 100` |
+| `hint_faults` | AutoNUMA `numa_hint_faults` 增量 |
+| `hint_local` | AutoNUMA `numa_hint_faults_local` 增量 |
+| `hint_remote_pct` | `(hint_faults - hint_local) / hint_faults × 100` |
+| `alloc_local` | `vmstat numa_local` 增量 |
+| `alloc_other` | `vmstat numa_other` 增量 |
+| `alloc_remote_pct` | `alloc_other / (alloc_local + alloc_other) × 100` |
+| `pages_migrated` | AutoNUMA 迁移页数增量 |
+
+---
+
+## scripts/numa_stat_monitor.py（分配局部性）
+
+专注于 `/proc/PID/numa_maps`（物理页分布）和 `/proc/vmstat` `numa_local`/`numa_other`（分配时局部性）。适合在 mysqld 启动阶段观察 buffer pool 内存落在哪些 NUMA 节点上。
+
+```bash
+python3 scripts/numa_stat_monitor.py --pid <mysqld-pid> \
+    --interval 5 --duration 60 --output ./numa_profile/alloc.csv
+
+# 只看大匿名段（buffer pool，默认阈值 64 MiB）
+python3 scripts/numa_stat_monitor.py --pid <mysqld-pid> --bp-only --bp-min-mb 64
+```
+
+---
+
+## scripts/numa_runtime_monitor.py（运行时访问局部性）
+
+专注于 `/sys/devices/system/node/nodeX/numastat` 和 AutoNUMA hint faults，不读取 numa_maps。适合在稳态压测阶段长时间采样。
+
+```bash
+python3 scripts/numa_runtime_monitor.py --pid <mysqld-pid> \
+    --interval 5 --duration 300 --output ./numa_profile/runtime.csv
 ```
 
 ---
