@@ -2169,6 +2169,7 @@ dberr_t Double_write::load_reduced_batch(dblwr::File &file,
   return (err);
 }
 
+// 写到 .dblwr 文件中并 fsync
 uint16_t Double_write::write_dblwr_pages(buf_flush_t flush_type) noexcept {
   ut_ad(mutex_own(&m_mutex));
   ut_a(!m_buffer.empty());
@@ -2184,7 +2185,7 @@ uint16_t Double_write::write_dblwr_pages(buf_flush_t flush_type) noexcept {
 
   batch_segment->start(this);
 
-  batch_segment->write(m_buffer);
+  batch_segment->write(m_buffer);  // 把整批页一次性顺序写到 dblwr 文件中
 
   m_bytes_written += m_buffer.size();
 
@@ -2192,7 +2193,7 @@ uint16_t Double_write::write_dblwr_pages(buf_flush_t flush_type) noexcept {
 
 #ifndef _WIN32
   if (is_fsync_required()) {
-    batch_segment->flush();
+    batch_segment->flush();        // fsync dblwr 文件
   }
 #endif /* !_WIN32 */
 
@@ -2255,12 +2256,13 @@ void Double_write::write_data_pages(buf_flush_t flush_type,
   os_aio_simulated_wake_handler_threads();
 }
 
+// 真正的两次写在这里
 void Double_write::write_pages(buf_flush_t flush_type) noexcept {
   ut_ad(mutex_own(&m_mutex));
   ut_a(!m_buffer.empty());
 
-  const uint16_t batch_id = write_dblwr_pages(flush_type);
-  write_data_pages(flush_type, batch_id);
+  const uint16_t batch_id = write_dblwr_pages(flush_type);  // 第一次写
+  write_data_pages(flush_type, batch_id);                   // 第二次写
 }
 
 dberr_t Double_write::create_batch_segments(

@@ -84,6 +84,33 @@ ninja -C build -j"$(nproc)"
 
 ---
 
+# tencent server
+```bash
+
+cmake -S . -B build -G Ninja \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DWITH_DEBUG=1 \
+  -DWITH_GROUP_REPLICATION=OFF \
+  -DWITHOUT_FEDERATED_STORAGE_ENGINE=ON \
+  -DWITH_BOOST=$PWD/boost/boost_1_77_0 \
+  -DWITH_SSL=system \
+  -DWITH_ZLIB=bundled \
+  -DWITH_ZSTD=bundled \
+  -DWITH_LZ4=bundled \
+  -DWITH_ICU=bundled \
+  -DWITH_READLINE=system \
+  -DWITH_NCURSES=system \
+  -DCMAKE_INSTALL_PREFIX=$PWD/install \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+```
+
+```bash
+ninja -C build -j"$(nproc)"
+```
+
+
 # NUMA Frame 统计 CSV（新增插桩）
 
 这个插桩在 `InnoDB buffer pool` 释放前（即服务关闭流程）执行：
